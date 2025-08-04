@@ -26,7 +26,7 @@ class QueryRequest(BaseModel):
 
 @app.post("/hackrx/run")
 async def run_query(payload: QueryRequest):
-    model = genai.GenerativeModel("gemini-pro")
+    model = genai.GenerativeModel(model_name="gemini-1.5-pro")
 
     prompt = f"""
     You are a highly intelligent assistant. You are given a policy document at this link: {payload.documents}.
