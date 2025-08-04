@@ -4,5 +4,4 @@ requests
 PyMuPDF
 faiss-cpu
 sentence-splitter
-python-multipart
 python-dotenv
