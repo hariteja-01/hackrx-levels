@@ -5,15 +5,16 @@ import logging
 import fitz  # PyMuPDF
 import faiss
 import numpy as np
+import hashlib
 from typing import List
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, HttpUrl
 import asyncio
 import aiohttp
-from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 import backoff
 import google.generativeai as genai
+from async_lru import alru_cache
 
 # Load environment variables
 load_dotenv()
@@ -25,37 +26,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- MODIFIED: Configuration ---
+# --- OPTIMIZED: Configuration ---
 class Config:
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    # REMOVED: Local embedding model
-    # ADDED: Gemini embedding and generation model names
     EMBEDDING_MODEL = "models/embedding-001"
-    GENERATION_MODEL = "gemini-1.5-flash" # Updated to a modern, efficient model
-    CHUNK_SIZE = 1000
-    CHUNK_OVERLAP = 200
-    MAX_CONTEXT_LENGTH = 10000
-    PDF_DOWNLOAD_TIMEOUT = 20 # Increased timeout for larger files
+    GENERATION_MODEL = "gemini-1.5-flash"
+    # Tuned for better context without losing meaning
+    CHUNK_SIZE = 800
+    CHUNK_OVERLAP = 100
+    MAX_CONTEXT_LENGTH = 12000 # Increased context for better answers
+    PDF_DOWNLOAD_TIMEOUT = 20
     MAX_RETRIES = 3
-    # ADDED: Embedding dimension for Google's model
     EMBEDDING_DIMENSION = 768
+    # Number of chunks to retrieve for context
+    RETRIEVAL_TOP_K = 7
+    # Batch size for embedding API calls
+    EMBEDDING_BATCH_SIZE = 100
 
 # Validate config and configure Gemini SDK
 if not Config.GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY environment variable not set")
 genai.configure(api_key=Config.GEMINI_API_KEY)
 
-# --- REMOVED: Loading SentenceTransformer model ---
-# This was the source of the memory issue.
-
-# FAISS index (initialized globally, built per request)
-faiss_index = faiss.IndexFlatL2(Config.EMBEDDING_DIMENSION)
+# FAISS index (re-created for each request)
+faiss_index = None
 
 # FastAPI app
 app = FastAPI(
-    title="Document Q&A with Gemini 1.5 Flash",
-    description="AI-powered insurance document analysis with RAG",
-    version="2.1.0"
+    title="High-Performance Document Q&A with Gemini",
+    description="Optimized RAG pipeline for maximum accuracy and speed.",
+    version="3.0.0"
 )
 
 # Data models
@@ -68,21 +68,36 @@ class DocumentResponse(BaseModel):
     answers: List[str]
     rationale: str
 
-# Utility functions
+# --- UPGRADED: Utility functions ---
 def preprocess_text(text: str) -> str:
-    return re.sub(r'\s+', ' ', text).strip()
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'(\w)-\s*(\w)', r'\1\2', text)
+    return text.strip()
 
+# --- UPGRADED: Sentence-aware chunking for higher accuracy ---
 def chunk_text(text: str) -> List[str]:
-    chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + Config.CHUNK_SIZE, len(text))
-        chunk = text[start:end]
-        chunks.append(chunk)
-        if end == len(text):
-            break
-        start = end - Config.CHUNK_OVERLAP
-    return chunks
+    # Split by paragraphs first, then sentences
+    single_chunks = []
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
+    for p in paragraphs:
+        sentences = re.split(r'(?<=[.!?])\s+', p)
+        single_chunks.extend([s for s in sentences if s])
+
+    # Combine sentences into semantic chunks
+    combined_chunks = []
+    current_chunk = ""
+    for sentence in single_chunks:
+        if len(current_chunk) + len(sentence) + 1 < Config.CHUNK_SIZE:
+            current_chunk += sentence + " "
+        else:
+            if current_chunk:
+                combined_chunks.append(current_chunk.strip())
+            current_chunk = sentence + " "
+    if current_chunk:
+        combined_chunks.append(current_chunk.strip())
+        
+    logger.info(f"Created {len(combined_chunks)} semantic chunks from text.")
+    return combined_chunks
 
 async def download_pdf(url: str) -> bytes:
     try:
@@ -95,105 +110,98 @@ async def download_pdf(url: str) -> bytes:
                 return await response.read()
     except Exception as e:
         logger.error(f"PDF download failed: {str(e)}")
-        raise HTTPException(
-            status_code=400,
-            detail=f"Failed to download or validate PDF from URL: {str(e)}"
-        )
+        raise HTTPException(status_code=400, detail=f"Failed to download PDF: {e}")
 
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        return preprocess_text("".join(page.get_text() for page in doc))
+        return preprocess_text(" ".join(page.get_text() for page in doc))
     except Exception as e:
         logger.error(f"PDF text extraction failed: {str(e)}")
-        raise HTTPException(
-            status_code=422,
-            detail="Failed to extract text from PDF document."
-        )
+        raise HTTPException(status_code=422, detail="Failed to extract text from PDF.")
 
-# --- MODIFIED: Embedding function uses Gemini API ---
+# --- UPGRADED: Batch embedding with caching ---
+@alru_cache(maxsize=128)
 @backoff.on_exception(backoff.expo, Exception, max_tries=Config.MAX_RETRIES)
-async def get_embeddings(text: str, task_type: str) -> np.ndarray:
+async def get_batch_embeddings(texts: List[str], task_type: str) -> List[np.ndarray]:
     try:
-        # Note: Using 'task_type' for retrieval is best practice
+        # Gemini API call for batch embeddings
         result = await genai.embed_content_async(
             model=Config.EMBEDDING_MODEL,
-            content=text,
-            task_type=task_type # "RETRIEVAL_DOCUMENT" or "RETRIEVAL_QUERY"
+            content=texts,
+            task_type=task_type
         )
-        return np.array(result['embedding'])
+        return [np.array(e) for e in result['embedding']]
     except Exception as e:
-        logger.error(f"Gemini embedding API request failed: {str(e)}")
+        logger.error(f"Gemini batch embedding failed: {str(e)}")
         raise
 
-# --- MODIFIED: FAISS index building is now async ---
 async def build_faiss_index(text_chunks: List[str]):
+    global faiss_index
     try:
-        # Generate embeddings for all document chunks concurrently
-        embedding_coroutines = [get_embeddings(chunk, "RETRIEVAL_DOCUMENT") for chunk in text_chunks]
-        embeddings = await asyncio.gather(*embedding_coroutines)
+        # Process in batches to handle large documents
+        all_embeddings = []
+        for i in range(0, len(text_chunks), Config.EMBEDDING_BATCH_SIZE):
+            batch_texts = text_chunks[i:i + Config.EMBEDDING_BATCH_SIZE]
+            embeddings_batch = await get_batch_embeddings(tuple(batch_texts), "RETRIEVAL_DOCUMENT")
+            all_embeddings.extend(embeddings_batch)
         
-        embeddings_np = np.array(embeddings).astype('float32')
-
-        global faiss_index
+        embeddings_np = np.array(all_embeddings).astype('float32')
         faiss_index = faiss.IndexFlatL2(Config.EMBEDDING_DIMENSION)
         faiss_index.add(embeddings_np)
-        logger.info(f"FAISS index built successfully with {len(text_chunks)} chunks.")
+        logger.info(f"FAISS index built successfully with {faiss_index.ntotal} vectors.")
     except Exception as e:
         logger.error(f"FAISS index build failed: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to build document index."
-        )
+        raise HTTPException(status_code=500, detail="Failed to build document index.")
 
-# --- MODIFIED: Retrieval function is now async ---
-async def retrieve_relevant_chunks(question: str, text_chunks: List[str], k: int = 5) -> List[str]:
+async def retrieve_relevant_chunks(question: str, text_chunks: List[str]) -> List[str]:
     try:
-        question_embedding = await get_embeddings(question, "RETRIEVAL_QUERY")
+        # Use batch embedder for a single question (benefits from caching)
+        question_embedding = (await get_batch_embeddings(tuple([question]), "RETRIEVAL_QUERY"))[0]
         question_embedding_np = question_embedding.reshape(1, -1).astype('float32')
         
-        _, indices = faiss_index.search(question_embedding_np, k)
+        _, indices = faiss_index.search(question_embedding_np, Config.RETRIEVAL_TOP_K)
         
         return [text_chunks[idx] for idx in indices[0] if 0 <= idx < len(text_chunks)]
     except Exception as e:
         logger.error(f"Chunk retrieval failed: {e}")
         return []
 
-# --- MODIFIED: Generation function uses Gemini SDK ---
-@backoff.on_exception(backoff.expo, Exception, max_tries=Config.MAX_RETRIES)
-async def generate_with_gemini(prompt: str) -> str:
+# --- UPGRADED: Advanced prompt for higher accuracy ---
+async def generate_answer(question: str, context: str, language: str) -> str:
+    prompt = f"""You are a world-class insurance document analysis AI. Your task is to provide a precise and factual answer to the question based *exclusively* on the provided context.
+
+Follow these instructions carefully:
+1.  **Analyze the Context**: Read the entire context provided below to understand the information it contains.
+2.  **Identify Key Information**: Find the specific sentences or phrases in the context that directly answer the question.
+3.  **Formulate the Answer**: Construct a concise answer in {language}.
+4.  **Strict Grounding**: Do NOT use any information outside of the provided context. If the answer cannot be found in the context, you MUST respond with "The answer to this question is not found in the provided document."
+
+**Context:**
+---
+{context}
+---
+
+**Question:** {question}
+
+**Answer:**
+"""
     try:
         model = genai.GenerativeModel(Config.GENERATION_MODEL)
         response = await model.generate_content_async(prompt)
         return response.text
     except Exception as e:
-        logger.error(f"Gemini generation API request failed: {str(e)}")
-        raise
-
-async def generate_answer(question: str, context: str, language: str) -> str:
-    prompt = f"""You are an expert insurance document analyst. Your task is to answer the user's question based *only* on the provided context. Do not use any external knowledge. If the answer is not in the context, state that clearly.
-    
-    **Context:**
-    ---
-    {context}
-    ---
-    
-    **Question:** {question}
-    
-    **Answer concisely in {language}:**"""
-    
-    try:
-        return await generate_with_gemini(prompt)
-    except Exception as e:
         logger.warning(f"Answer generation failed: {str(e)}")
         return f"Could not generate an answer due to an API error: {str(e)}"
 
-# --- MODIFIED: Question processing is now fully async ---
-async def process_single_question(question: str, text_chunks: List[str], language: str) -> str:
+# --- UPGRADED: Caching at the question-processing level ---
+@alru_cache(maxsize=256)
+async def process_single_question(doc_id: str, question: str, text_chunks: List[str], language: str) -> str:
+    # `doc_id` is used by the cache to differentiate questions about different documents
     try:
         relevant_chunks = await retrieve_relevant_chunks(question, text_chunks)
         if not relevant_chunks:
-            return "Could not find relevant information in the document to answer the question."
+            return "The answer to this question is not found in the provided document."
             
         context = "\n\n".join(relevant_chunks)[:Config.MAX_CONTEXT_LENGTH]
         return await generate_answer(question, context, language)
@@ -201,63 +209,52 @@ async def process_single_question(question: str, text_chunks: List[str], languag
         logger.error(f"Question processing failed for '{question}': {str(e)}")
         return "An error occurred while processing the question."
 
-# API endpoints
-@app.post(
-    "/hackrx/run",
-    response_model=DocumentResponse,
-    responses={
-        400: {"description": "Bad Request: Invalid URL or file"},
-        422: {"description": "Unprocessable Entity: Failed to parse PDF"},
-        500: {"description": "Internal Server Error"}
-    }
-)
+# --- Main API Endpoint ---
+@app.post("/hackrx/run", response_model=DocumentResponse)
 async def answer_questions(request: DocumentRequest):
     try:
         start_time = time.time()
         
         pdf_bytes = await download_pdf(request.documents)
+        # Create a unique ID for the document content for caching
+        doc_id = hashlib.sha256(pdf_bytes).hexdigest()
+
         pdf_text = extract_text_from_pdf(pdf_bytes)
         text_chunks = chunk_text(pdf_text)
         
         if not text_chunks:
-            raise HTTPException(status_code=422, detail="Document appears to be empty or could not be read.")
+            raise HTTPException(status_code=422, detail="Document is empty or unreadable.")
 
-        # Build FAISS index for this request
         await build_faiss_index(text_chunks)
         
-        # Process all questions concurrently
-        answers = await asyncio.gather(*[
-            process_single_question(q, text_chunks, request.language)
+        # Process questions concurrently
+        tasks = [
+            process_single_question(doc_id, q, tuple(text_chunks), request.language)
             for q in request.questions
-        ])
+        ]
+        answers = await asyncio.gather(*tasks)
         
         total_time = time.time() - start_time
         rationale = (
-            f"Processed {len(request.questions)} questions in {total_time:.2f}s. "
-            f"Used {Config.GENERATION_MODEL} and {Config.EMBEDDING_MODEL}. "
-            f"Analyzed {len(text_chunks)} document chunks."
+            f"Successfully processed {len(request.questions)} questions in {total_time:.2f}s. "
+            f"Model: {Config.GENERATION_MODEL}. "
+            f"Analyzed {len(text_chunks)} semantic chunks. "
+            f"Performance optimizations: Batch Embeddings, Semantic Chunking, Advanced Prompting, Caching."
         )
         
-        return DocumentResponse(answers=answers, rationale=rationale)
+        return DocumentResponse(answers=list(answers), rationale=rationale)
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"An unexpected error occurred in /hackrx/run: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"An internal processing error occurred: {str(e)}"
-        )
+        logger.error(f"Critical error in /hackrx/run: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal processing error occurred.")
 
 @app.get("/health")
 async def health_check():
-    return {
-        "status": "operational",
-        "generation_model": Config.GENERATION_MODEL,
-        "embedding_model": Config.EMBEDDING_MODEL,
-        "rag_enabled": True
-    }
+    return {"status": "operational", "model": Config.GENERATION_MODEL, "optimizations_enabled": True}
 
 if __name__ == "__main__":
     import uvicorn
+    # Note: for production, consider a more robust server like uvicorn with gunicorn workers
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
