@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: insurance-qa
+    runtime: python
+    pythonVersion: "3.9"
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: GEMINI_API_KEY
+        value: your_api_key_here  # Replace with yours!
+    plan: starter  # Required for memory
+    healthCheckPath: /health
+    autoDeploy: true
